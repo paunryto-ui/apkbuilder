@@ -2026,14 +2026,8 @@ async function startBuild() {
     const htmlB64 = btoa(unescape(encodeURIComponent(htmlContent)));
     await pushFile(user, repo, token, 'www/index.html', htmlB64, '📄 Add app HTML [skip ci]');
     addLog('✅ HTML pushed.', 'ok');
-    setProgress(38, 'Pushing config...');
-
-    const capConfig = generateCapConfig(appName, appPkg, splashDuration, splashBg, splashAccent);
-    const capB64 = btoa(unescape(encodeURIComponent(capConfig)));
-    await pushFile(user, repo, token, 'capacitor.config.json', capB64, '⚙️ Add Capacitor config [skip ci]');
-    addLog('✅ Capacitor config pushed.', 'ok');
-    setProgress(45, 'All files ready. Triggering build...');
-    await sleep(1000);
+    setProgress(42, 'All files ready. Triggering build...');
+    await sleep(800);
 
     // Step 4: Trigger workflow dispatch
     const dispatchRes = await fetch(`https://api.github.com/repos/${user}/${repo}/actions/workflows/build.yml/dispatches`, {
@@ -2262,17 +2256,25 @@ function generateWorkflow(buildType, appName, appPkg, appVer, appVerCode, minApi
     : (isRelease ? 'android/app/build/outputs/apk/release/app-release.apk' : 'android/app/build/outputs/apk/debug/app-debug.apk');
   const artifactName = isAAB ? 'app-aab' : (isRelease ? 'app-release' : 'app-debug');
   const orientation = ratio === 'portrait' ? 'portrait' : (ratio === 'landscape' ? 'sensorLandscape' : 'unspecified');
+  const safeAppName = appName.replace(/['"\\]/g, '');
+  const safeAppPkg  = appPkg.replace(/['"\\]/g, '');
 
   const fontStep = designEnabled.font ? `
-      - name: Inject custom font into HTML
+      - name: Inject custom font
         run: |
-          sed -i "s|</head>|<link href='https://fonts.googleapis.com/css2?family=${font.replace(/ /g,'+')}:wght@400;600;700\\&display=swap' rel='stylesheet'><style>body,*{font-family:'${font}',sans-serif!important}</style></head>|g" www/index.html || true` : '';
+          sed -i "s|</head>|<link href='https://fonts.googleapis.com/css2?family=${font.replace(/ /g,'+')}:wght@400;600;700\\&display=swap' rel='stylesheet'><style>body,*{font-family:'${font}',sans-serif!important}</style></head>|g" www/index.html || true
+` : '';
 
   const orientStep = designEnabled.ratio && ratio !== 'adaptive' ? `
       - name: Set screen orientation
         run: |
-          sed -i 's/android:screenOrientation="[^"]*"/android:screenOrientation="${orientation}"/g' android/app/src/main/AndroidManifest.xml || true
-          grep -q 'screenOrientation' android/app/src/main/AndroidManifest.xml || sed -i 's/android:name=".MainActivity"/android:name=".MainActivity" android:screenOrientation="${orientation}"/g' android/app/src/main/AndroidManifest.xml || true` : '';
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if grep -q 'screenOrientation' "$MANIFEST"; then
+            sed -i 's/android:screenOrientation="[^"]*"/android:screenOrientation="${orientation}"/g' "$MANIFEST"
+          else
+            sed -i 's/android:name=".MainActivity"/android:name=".MainActivity" android:screenOrientation="${orientation}"/g' "$MANIFEST"
+          fi
+` : '';
 
   return `name: Build Android APK
 
@@ -2284,7 +2286,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js 22
@@ -2301,45 +2303,71 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Capacitor (pinned v7 for stability)
+      - name: Create package.json
         run: |
-          npm init -y
-          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          cat > package.json << 'PKGJSON'
+          {
+            "name": "app",
+            "version": "1.0.0",
+            "description": "",
+            "main": "index.js",
+            "scripts": {},
+            "keywords": [],
+            "author": "",
+            "license": "ISC"
+          }
+          PKGJSON
 
-      - name: Init Capacitor project
+      - name: Install Capacitor v7
         run: |
-          npx cap init "${appName}" "${appPkg}" --web-dir www
+          npm install --save @capacitor/core@7.0.0 @capacitor/android@7.0.0
+          npm install --save-dev @capacitor/cli@7.0.0
+
+      - name: Create capacitor.config.json
+        run: |
+          cat > capacitor.config.json << 'CAPCONF'
+          {
+            "appId": "${safeAppPkg}",
+            "appName": "${safeAppName}",
+            "webDir": "www",
+            "server": {
+              "androidScheme": "https"
+            }
+          }
+          CAPCONF
 
       - name: Add Android platform
-        run: |
-          npx cap add android
+        run: npx cap add android
 
-      - name: Patch build.gradle versions
+      - name: Verify android folder exists
+        run: |
+          ls android/app/build.gradle || (echo "ERROR: android folder not created!" && exit 1)
+
+      - name: Patch build.gradle
         run: |
           GRADLE="android/app/build.gradle"
-          # versionCode
+          echo "--- Before patch ---"
+          grep -E "versionCode|versionName|minSdk|targetSdk|compileSdk" "$GRADLE" || true
+          sed -i "s/versionCode [0-9]\\+/versionCode ${appVerCode}/g" "$GRADLE"
           sed -i "s/versionCode [0-9]*/versionCode ${appVerCode}/g" "$GRADLE"
-          # versionName
-          sed -i 's/versionName "[^"]*"/versionName "${appVer}"/g' "$GRADLE"
-          # minSdk
+          sed -i 's/versionName \\"[^\\"]*\\"/versionName \\"${appVer}\\"/g' "$GRADLE"
+          sed -i "s/minSdk [0-9]\\+/minSdk ${minApi}/g" "$GRADLE"
           sed -i "s/minSdk [0-9]*/minSdk ${minApi}/g" "$GRADLE"
-          # targetSdk
+          sed -i "s/targetSdk [0-9]\\+/targetSdk ${targetApi}/g" "$GRADLE"
           sed -i "s/targetSdk [0-9]*/targetSdk ${targetApi}/g" "$GRADLE"
-          # compileSdk
+          sed -i "s/compileSdk [0-9]\\+/compileSdk ${targetApi}/g" "$GRADLE"
           sed -i "s/compileSdk [0-9]*/compileSdk ${targetApi}/g" "$GRADLE"
-          echo "=== build.gradle (version section) ==="
-          grep -E "versionCode|versionName|minSdk|targetSdk|compileSdk" "$GRADLE"
+          echo "--- After patch ---"
+          grep -E "versionCode|versionName|minSdk|targetSdk|compileSdk" "$GRADLE" || true
 ${fontStep}${orientStep}
-      - name: Sync Capacitor to Android
+      - name: Sync Capacitor
         run: npx cap sync android
-
-      - name: Make Gradle executable
-        run: chmod +x android/gradlew
 
       - name: Build ${buildType.toUpperCase()}
         run: |
           cd android
-          ${gradleCmd}
+          chmod +x gradlew
+          ./gradlew ${gradleCmd.replace('./gradlew ','')} --stacktrace
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
