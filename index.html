@@ -1967,13 +1967,46 @@ async function startBuild() {
     }
 
     if (createRes.status === 422) {
-      addLog('⚠️ Repo already exists, using existing.', 'warn');
+      addLog('⚠️ Repo sudah ada, menggunakan yang existing.', 'warn');
     } else {
-      addLog('✅ Repository created: github.com/' + user + '/' + repo, 'ok');
+      addLog('✅ Repository dibuat: github.com/' + user + '/' + repo, 'ok');
     }
 
+    // ── Wait for repo to be fully initialized (GitHub needs a few seconds)
+    setProgress(12, 'Menunggu repo siap...');
+    addLog('⏳ Menunggu repo selesai diinit GitHub...', 'info');
+    await sleep(3000);
+
+    // Verify repo is accessible + has a default branch (retry up to 8x)
+    let repoReady = false;
+    for (let i = 0; i < 8; i++) {
+      try {
+        const checkRes = await fetch(`https://api.github.com/repos/${user}/${repo}/git/refs/heads/main`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+          }
+        });
+        if (checkRes.ok) { repoReady = true; break; }
+        // Try 'master' branch too
+        const checkMaster = await fetch(`https://api.github.com/repos/${user}/${repo}/git/refs/heads/master`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+          }
+        });
+        if (checkMaster.ok) { repoReady = true; break; }
+      } catch(e) {}
+      addLog(`⏳ Repo belum siap, retry ${i+1}/8...`, 'info');
+      await sleep(2500);
+    }
+
+    if (!repoReady) throw new Error('Repo tidak bisa diakses setelah dibuat. Coba lagi atau cek GitHub.');
+    addLog('✅ Repo siap!', 'ok');
     setProgress(20, 'Pushing files...');
-    await sleep(400);
+    await sleep(300);
 
     // ── Push all files FIRST (with [skip ci] so each push doesn't trigger a build)
     // Then dispatch workflow ONCE after all files are ready
@@ -2169,42 +2202,54 @@ async function startBuild() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function pushFile(user, repo, token, path, contentB64, message) {
-  // Check if file exists first (to get SHA)
-  let sha;
-  try {
-    const check = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28'
+async function pushFile(user, repo, token, path, contentB64, message, retries = 4) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      // Get SHA if file already exists
+      let sha;
+      const check = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      });
+      if (check.ok) {
+        const d = await check.json();
+        sha = d.sha;
       }
-    });
-    if (check.ok) {
-      const d = await check.json();
-      sha = d.sha;
+
+      const body = { message, content: contentB64 };
+      if (sha) body.sha = sha;
+
+      const res = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'X-GitHub-Api-Version': '2022-11-28'
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (res.ok) return res.json();
+
+      const d = await res.json();
+      // If Not Found (404) or conflict (409), wait and retry
+      if ((res.status === 404 || res.status === 409) && attempt < retries - 1) {
+        await sleep(3000 + attempt * 1000);
+        continue;
+      }
+      throw new Error(`Failed to push ${path}: ${d.message} (HTTP ${res.status})`);
+    } catch(e) {
+      if (attempt < retries - 1) {
+        await sleep(2000 + attempt * 1000);
+        continue;
+      }
+      throw e;
     }
-  } catch(e) {}
-
-  const body = { message, content: contentB64 };
-  if (sha) body.sha = sha;
-
-  const res = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
-    method: 'PUT',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/vnd.github+json',
-      'Content-Type': 'application/json',
-      'X-GitHub-Api-Version': '2022-11-28'
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!res.ok) {
-    const d = await res.json();
-    throw new Error(`Failed to push ${path}: ${d.message}`);
   }
-  return res.json();
 }
 
 // ===== GENERATE WORKFLOW =====
