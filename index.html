@@ -1897,7 +1897,7 @@ function setProgress(pct, label) {
 }
 
 async function startBuild() {
-  // Reset
+  // Reset UI
   document.getElementById('buildLog').innerHTML = '';
   document.getElementById('resultCard').classList.remove('show');
   document.getElementById('errorCard').style.display = 'none';
@@ -1921,24 +1921,59 @@ async function startBuild() {
   const splashAccent = document.getElementById('splashAccent').value;
   const splashDuration = document.getElementById('splashDuration').value;
 
+  // === INPUT VALIDATION ===
+  if (!user || !token || !repo) {
+    addLog('❌ GitHub username, token, dan repo wajib diisi!', 'err');
+    document.getElementById('errorCard').style.display = 'block';
+    document.getElementById('errorDesc').innerHTML = '<strong>Lengkapi data GitHub di Step 1 terlebih dahulu.</strong>';
+    return;
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(repo)) {
+    addLog('❌ Nama repo tidak valid. Gunakan huruf kecil, angka, dan tanda hubung saja.', 'err');
+    document.getElementById('errorCard').style.display = 'block';
+    document.getElementById('errorDesc').innerHTML = '<strong>Nama repo tidak valid.</strong>';
+    return;
+  }
+  const pkgRegex = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,}$/;
+  if (!pkgRegex.test(appPkg)) {
+    addLog('❌ Package ID tidak valid. Format: com.nama.app', 'err');
+    document.getElementById('errorCard').style.display = 'block';
+    document.getElementById('errorDesc').innerHTML = '<strong>Package ID tidak valid. Contoh: com.perusahaan.namaapp</strong>';
+    return;
+  }
+
   // Get HTML content
   let htmlContent = '';
   if (state.htmlMode === 'paste') {
-    htmlContent = document.getElementById('htmlCode').value || getDefaultHTML(appName, font, splashBg, splashAccent);
+    htmlContent = document.getElementById('htmlCode').value.trim() || getDefaultHTML(appName, font, splashBg, splashAccent);
   } else if (state.htmlMode === 'url') {
-    htmlContent = getUrlHTML(document.getElementById('htmlUrl').value);
+    const url = document.getElementById('htmlUrl').value.trim();
+    if (!url || !/^https?:\/\/.+/.test(url)) {
+      addLog('❌ URL tidak valid. Harus dimulai dengan https://', 'err');
+      document.getElementById('errorCard').style.display = 'block';
+      document.getElementById('errorDesc').innerHTML = '<strong>URL tidak valid.</strong>';
+      return;
+    }
+    htmlContent = getUrlHTML(url);
   } else {
     const htmlFile = document.getElementById('htmlFile').files[0];
-    if (htmlFile && htmlFile.name.endsWith('.html')) {
-      htmlContent = await htmlFile.text();
+    if (htmlFile) {
+      if (htmlFile.name.endsWith('.html') || htmlFile.name.endsWith('.htm')) {
+        htmlContent = await htmlFile.text();
+      } else if (htmlFile.name.endsWith('.zip')) {
+        // For zip: we'll push the zip and extract in workflow
+        htmlContent = null; // handled separately below
+      } else {
+        htmlContent = getDefaultHTML(appName, font, splashBg, splashAccent);
+      }
     } else {
       htmlContent = getDefaultHTML(appName, font, splashBg, splashAccent);
     }
   }
 
-  // Simulate + real GitHub API calls
   addLog('🚀 Starting APK build for "' + appName + '"', 'info');
   addLog('📋 Build type: ' + buildType.toUpperCase(), 'info');
+  addLog('📦 Package: ' + appPkg, 'info');
 
   try {
     // Step 1: Create Repo
@@ -1967,44 +2002,37 @@ async function startBuild() {
     }
 
     if (createRes.status === 422) {
-      addLog('⚠️ Repo sudah ada, menggunakan yang existing.', 'warn');
+      addLog('⚠️ Repo already exists, using existing.', 'warn');
     } else {
-      addLog('✅ Repository dibuat: github.com/' + user + '/' + repo, 'ok');
+      addLog('✅ Repository created: github.com/' + user + '/' + repo, 'ok');
     }
 
-    // ── Wait for repo to be fully initialized (GitHub needs a few seconds)
-    setProgress(12, 'Menunggu repo siap...');
-    addLog('⏳ Menunggu repo selesai diinit GitHub...', 'info');
-    await sleep(3000);
-
-    // Verify repo is accessible + has a default branch (retry up to 8x)
+    // Wait for repo to be fully ready (retry up to 8 times)
+    setProgress(12, 'Waiting for repo to be ready...');
     let repoReady = false;
-    for (let i = 0; i < 8; i++) {
-      try {
-        const checkRes = await fetch(`https://api.github.com/repos/${user}/${repo}/git/refs/heads/main`, {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28'
-          }
-        });
-        if (checkRes.ok) { repoReady = true; break; }
-        // Try 'master' branch too
-        const checkMaster = await fetch(`https://api.github.com/repos/${user}/${repo}/git/refs/heads/master`, {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28'
-          }
-        });
-        if (checkMaster.ok) { repoReady = true; break; }
-      } catch(e) {}
-      addLog(`⏳ Repo belum siap, retry ${i+1}/8...`, 'info');
+    for (let attempt = 1; attempt <= 8; attempt++) {
       await sleep(2500);
+      try {
+        const checkRes = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+          }
+        });
+        if (checkRes.ok || checkRes.status === 404) {
+          // 404 = repo exists but empty, that's fine — we'll push files
+          repoReady = true;
+          addLog(`✅ Repo siap! (attempt ${attempt})`, 'ok');
+          break;
+        }
+      } catch(e) {}
+      addLog(`⏳ Repo belum siap, retry ${attempt}/8...`, 'warn');
+    }
+    if (!repoReady) {
+      throw new Error('Repo tidak bisa diakses setelah 8 percobaan. Cek koneksi & token permissions.');
     }
 
-    if (!repoReady) throw new Error('Repo tidak bisa diakses setelah dibuat. Coba lagi atau cek GitHub.');
-    addLog('✅ Repo siap!', 'ok');
     setProgress(20, 'Pushing files...');
     await sleep(300);
 
@@ -2023,11 +2051,57 @@ async function startBuild() {
     addLog('✅ Workflow file pushed.', 'ok');
     setProgress(30, 'Pushing HTML...');
 
-    const htmlB64 = btoa(unescape(encodeURIComponent(htmlContent)));
-    await pushFile(user, repo, token, 'www/index.html', htmlB64, '📄 Add app HTML [skip ci]');
-    addLog('✅ HTML pushed.', 'ok');
-    setProgress(42, 'All files ready. Triggering build...');
-    await sleep(800);
+    if (htmlContent !== null) {
+      const htmlB64 = btoa(unescape(encodeURIComponent(htmlContent)));
+      await pushFile(user, repo, token, 'www/index.html', htmlB64, '📄 Add app HTML [skip ci]');
+      addLog('✅ HTML pushed.', 'ok');
+    } else {
+      addLog('📦 ZIP file will be extracted on runner.', 'info');
+    }
+    setProgress(38, 'Pushing config...');
+
+    const capConfig = generateCapConfig(appName, appPkg, splashDuration, splashBg, splashAccent);
+    const capB64 = btoa(unescape(encodeURIComponent(capConfig)));
+    await pushFile(user, repo, token, 'capacitor.config.json', capB64, '⚙️ Add Capacitor config [skip ci]');
+    addLog('✅ Capacitor config pushed.', 'ok');
+
+    // Push package.json so npm install works cleanly (no npm init needed)
+    const pkgJson = JSON.stringify({ name: repo, version: appVer, private: true }, null, 2);
+    const pkgB64 = btoa(unescape(encodeURIComponent(pkgJson)));
+    await pushFile(user, repo, token, 'package.json', pkgB64, '📦 Add package.json [skip ci]');
+    addLog('✅ package.json pushed.', 'ok');
+    setProgress(40, 'Pushing icon...');
+
+    // Push icon if provided
+    const iconFileEl = document.getElementById('iconFile').files[0];
+    if (iconFileEl) {
+      try {
+        const iconB64 = await fileToBase64(iconFileEl);
+        await pushFile(user, repo, token, 'icon.png', iconB64, '🖼️ Add app icon [skip ci]');
+        addLog('✅ Icon pushed.', 'ok');
+      } catch(e) {
+        addLog('⚠️ Icon push failed (non-critical): ' + e.message, 'warn');
+      }
+    }
+
+    // Push zip file if provided (as assets/app.zip, workflow will extract)
+    const htmlFileEl = document.getElementById('htmlFile').files[0];
+    if (htmlFileEl && htmlFileEl.name.endsWith('.zip') && htmlContent === null) {
+      try {
+        setProgress(42, 'Pushing zip file...');
+        const zipB64 = await fileToBase64(htmlFileEl);
+        await pushFile(user, repo, token, 'app.zip', zipB64, '📦 Add app zip [skip ci]');
+        addLog('✅ ZIP file pushed.', 'ok');
+      } catch(e) {
+        addLog('⚠️ ZIP push failed, using default HTML: ' + e.message, 'warn');
+        htmlContent = getDefaultHTML(appName, font, splashBg, splashAccent);
+        const fallbackB64 = btoa(unescape(encodeURIComponent(htmlContent)));
+        await pushFile(user, repo, token, 'www/index.html', fallbackB64, '📄 Add fallback HTML [skip ci]');
+      }
+    }
+
+    setProgress(45, 'All files ready. Triggering build...');
+    await sleep(1000);
 
     // Step 4: Trigger workflow dispatch
     const dispatchRes = await fetch(`https://api.github.com/repos/${user}/${repo}/actions/workflows/build.yml/dispatches`, {
@@ -2041,6 +2115,10 @@ async function startBuild() {
       body: JSON.stringify({ ref: 'main' })
     });
 
+    if (!dispatchRes.ok) {
+      const errData = await dispatchRes.json().catch(() => ({}));
+      throw new Error(`Failed to trigger workflow: ${errData.message || dispatchRes.status}. Pastikan file build.yml sudah ter-push dan workflow ada di branch main.`);
+    }
     addLog('✅ GitHub Actions triggered! Build started.', 'ok');
     setProgress(52, 'Waiting for runner...');
 
@@ -2051,11 +2129,11 @@ async function startBuild() {
 
     // Poll for the workflow run — wait a bit for GH to register the dispatch
     addLog('⏳ Waiting for GitHub to queue the job...', 'info');
-    await sleep(6000);
-
     const dispatchTime = Date.now();
+    await sleep(10000);
+
     let runId = null;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 15; i++) {
       const runsRes = await fetch(`https://api.github.com/repos/${user}/${repo}/actions/runs?per_page=10&event=workflow_dispatch`, {
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -2067,7 +2145,7 @@ async function startBuild() {
       // Find a run created after we dispatched (within last 2 min)
       const recent = (runsData.workflow_runs || []).find(r => {
         const created = new Date(r.created_at).getTime();
-        return created >= dispatchTime - 10000; // 10s buffer
+        return created >= dispatchTime - 30000; // 30s buffer
       });
       if (recent) {
         runId = recent.id;
@@ -2076,8 +2154,8 @@ async function startBuild() {
         addLog('🔍 Run ID: ' + runId, 'info');
         break;
       }
-      addLog(`⏳ Waiting for runner... (${i+1}/12)`, 'info');
-      await sleep(4000);
+      addLog(`⏳ Waiting for runner... (${i+1}/15)`, 'info');
+      await sleep(5000);
     }
 
     if (!runId) {
@@ -2090,7 +2168,7 @@ async function startBuild() {
     // Step 6: Poll build status
     let complete = false;
     let polls = 0;
-    const maxPolls = 60; // 5 min max
+    const maxPolls = 90; // ~7.5 min max (90 * 5s)
     const fakeMessages = [
       'Installing Node.js & dependencies...',
       'Setting up Java 17...',
@@ -2148,31 +2226,46 @@ async function startBuild() {
           setProgress(100, 'Done!');
           addLog('🎉 APK ready for download!', 'ok');
 
-          // Show result
-          const apkArt = artData.artifacts?.find(a => a.name.includes('apk') || a.name.includes('debug'));
-          const aabArt = artData.artifacts?.find(a => a.name.includes('aab') || a.name.includes('release'));
-          
+          const artifacts = artData.artifacts || [];
+          addLog(`📦 Found ${artifacts.length} artifact(s).`, 'info');
+
           const dlAPK = document.getElementById('dlAPK');
           const dlAAB = document.getElementById('dlAAB');
 
+          // Find APK artifact
+          const apkArt = artifacts.find(a =>
+            a.name === 'app-debug' || a.name === 'app-release' ||
+            a.name.includes('apk') || a.name.includes('debug') || a.name.includes('release')
+          );
+          // Find AAB artifact
+          const aabArt = artifacts.find(a =>
+            a.name === 'app-aab' || a.name.includes('aab') || a.name.includes('bundle')
+          );
+
           if (apkArt) {
-            dlAPK.href = `https://github.com/${user}/${repo}/actions/runs/${runId}/artifacts/${apkArt.id}`;
-            dlAPK.textContent = `⬇️ Download APK (${formatBytes(apkArt.size_in_bytes)})`;
+            // GitHub artifact download requires login — link to the Actions run page
+            dlAPK.href = `https://github.com/${user}/${repo}/actions/runs/${runId}`;
+            dlAPK.textContent = `⬇️ Download APK (${formatBytes(apkArt.size_in_bytes)}) — Buka di GitHub`;
+            addLog(`✅ Artifact: ${apkArt.name} (${formatBytes(apkArt.size_in_bytes)})`, 'ok');
           } else {
             dlAPK.href = ghLink;
             dlAPK.textContent = '🔗 View on GitHub Actions';
           }
 
           if (buildType === 'aab' && aabArt) {
-            dlAAB.href = `https://github.com/${user}/${repo}/actions/runs/${runId}/artifacts/${aabArt.id}`;
+            dlAAB.href = `https://github.com/${user}/${repo}/actions/runs/${runId}`;
+            dlAAB.textContent = `⬇️ Download AAB (${formatBytes(aabArt.size_in_bytes)})`;
             dlAAB.style.display = 'inline-flex';
+          } else if (buildType !== 'aab') {
+            dlAAB.style.display = 'none';
           }
 
-          document.getElementById('resultDesc').textContent = `"${appName}" berhasil dibuild. Artifact tersimpan 90 hari di GitHub Actions.`;
+          document.getElementById('resultDesc').textContent = `"${appName}" berhasil dibuild! Klik tombol di bawah untuk ke GitHub Actions, lalu download artifact-nya. Tersimpan 90 hari.`;
           document.getElementById('resultCard').classList.add('show');
 
         } else {
-          throw new Error(`Build failed with conclusion: ${conclusion}. Check logs at ${ghLink}`);
+          const logsUrl = `https://github.com/${user}/${repo}/actions/runs/${runId}`;
+          throw new Error(`Build failed (${conclusion}). <a href="${logsUrl}" target="_blank" style="color:var(--accent)">Lihat log lengkap di GitHub →</a>`);
         }
       }
     }
@@ -2184,7 +2277,7 @@ async function startBuild() {
     }
 
   } catch (err) {
-    addLog('❌ Error: ' + err.message, 'err');
+    addLog('❌ Error: ' + err.message.replace(/<[^>]*>/g, ''), 'err');
     setProgress(0, 'Failed');
     document.getElementById('errorCard').style.display = 'block';
     document.getElementById('errorDesc').innerHTML = `
@@ -2196,26 +2289,45 @@ async function startBuild() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function pushFile(user, repo, token, path, contentB64, message, retries = 4) {
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      // Get SHA if file already exists
-      let sha;
-      const check = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28'
-        }
-      });
-      if (check.ok) {
-        const d = await check.json();
-        sha = d.sha;
+// Convert File to raw base64 (no data URL prefix)
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      // strip "data:...;base64," prefix
+      const b64 = result.includes(',') ? result.split(',')[1] : result;
+      resolve(b64);
+    };
+    reader.onerror = () => reject(new Error('Failed to read file: ' + file.name));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function pushFile(user, repo, token, path, contentB64, message) {
+  // Check if file exists first (to get SHA for update)
+  let sha;
+  try {
+    const check = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
       }
+    });
+    if (check.ok) {
+      const d = await check.json();
+      sha = d.sha;
+    }
+  } catch(e) {}
 
-      const body = { message, content: contentB64 };
-      if (sha) body.sha = sha;
+  const body = { message, content: contentB64 };
+  if (sha) body.sha = sha;
 
+  // Retry up to 3 times on failure
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
       const res = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
         method: 'PUT',
         headers: {
@@ -2226,24 +2338,24 @@ async function pushFile(user, repo, token, path, contentB64, message, retries = 
         },
         body: JSON.stringify(body)
       });
-
-      if (res.ok) return res.json();
-
+      if (res.ok) return await res.json();
       const d = await res.json();
-      // If Not Found (404) or conflict (409), wait and retry
-      if ((res.status === 404 || res.status === 409) && attempt < retries - 1) {
-        await sleep(3000 + attempt * 1000);
-        continue;
+      lastError = `Push ${path} failed (${res.status}): ${d.message}`;
+      if (res.status === 422 && d.message && d.message.includes('sha')) {
+        // SHA conflict - re-fetch SHA and retry
+        try {
+          const recheck = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`, {
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }
+          });
+          if (recheck.ok) { const rd = await recheck.json(); body.sha = rd.sha; }
+        } catch(e2) {}
       }
-      throw new Error(`Failed to push ${path}: ${d.message} (HTTP ${res.status})`);
     } catch(e) {
-      if (attempt < retries - 1) {
-        await sleep(2000 + attempt * 1000);
-        continue;
-      }
-      throw e;
+      lastError = `Network error pushing ${path}: ${e.message}`;
     }
+    if (attempt < 3) await sleep(2000);
   }
+  throw new Error(lastError);
 }
 
 // ===== GENERATE WORKFLOW =====
@@ -2256,25 +2368,61 @@ function generateWorkflow(buildType, appName, appPkg, appVer, appVerCode, minApi
     : (isRelease ? 'android/app/build/outputs/apk/release/app-release.apk' : 'android/app/build/outputs/apk/debug/app-debug.apk');
   const artifactName = isAAB ? 'app-aab' : (isRelease ? 'app-release' : 'app-debug');
   const orientation = ratio === 'portrait' ? 'portrait' : (ratio === 'landscape' ? 'sensorLandscape' : 'unspecified');
-  const safeAppName = appName.replace(/['"\\]/g, '');
-  const safeAppPkg  = appPkg.replace(/['"\\]/g, '');
 
   const fontStep = designEnabled.font ? `
-      - name: Inject custom font
+      - name: Inject custom font into HTML
         run: |
-          sed -i "s|</head>|<link href='https://fonts.googleapis.com/css2?family=${font.replace(/ /g,'+')}:wght@400;600;700\\&display=swap' rel='stylesheet'><style>body,*{font-family:'${font}',sans-serif!important}</style></head>|g" www/index.html || true
-` : '';
+          sed -i "s|</head>|<link href='https://fonts.googleapis.com/css2?family=${font.replace(/ /g,'+')}:wght@400;600;700\\&display=swap' rel='stylesheet'><style>body,*{font-family:'${font}',sans-serif!important}</style></head>|g" www/index.html || true` : '';
 
   const orientStep = designEnabled.ratio && ratio !== 'adaptive' ? `
       - name: Set screen orientation
         run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if grep -q 'screenOrientation' "$MANIFEST"; then
-            sed -i 's/android:screenOrientation="[^"]*"/android:screenOrientation="${orientation}"/g' "$MANIFEST"
+          sed -i "s/android:screenOrientation=\\"[^\\"]*\\"/android:screenOrientation=\\"${orientation}\\"/g" android/app/src/main/AndroidManifest.xml || true
+          grep -q 'screenOrientation' android/app/src/main/AndroidManifest.xml || sed -i "s/android:name=\\".MainActivity\\"/android:name=\\".MainActivity\\" android:screenOrientation=\\"${orientation}\\"/g" android/app/src/main/AndroidManifest.xml || true` : '';
+
+  const zipExtractStep = `
+      - name: Extract app.zip if present
+        run: |
+          if [ -f app.zip ]; then
+            echo "Extracting app.zip into www/"
+            mkdir -p www
+            unzip -o app.zip -d www/
+            SUBDIRS=\$(find www -maxdepth 1 -mindepth 1 -type d | wc -l)
+            FILES=\$(find www -maxdepth 1 -mindepth 1 -type f | wc -l)
+            if [ "\$SUBDIRS" -eq 1 ] && [ "\$FILES" -eq 0 ]; then
+              SUBDIR=\$(find www -maxdepth 1 -mindepth 1 -type d)
+              mv "\$SUBDIR"/* www/ 2>/dev/null || true
+              rmdir "\$SUBDIR" 2>/dev/null || true
+            fi
+            echo "www/ contents:" && ls www/
           else
-            sed -i 's/android:name=".MainActivity"/android:name=".MainActivity" android:screenOrientation="${orientation}"/g' "$MANIFEST"
-          fi
-` : '';
+            echo "No app.zip found, using existing www/"
+          fi`;
+
+  const iconStep = `
+      - name: Inject app icon
+        run: |
+          if [ -f icon.png ]; then
+            echo "Injecting icon.png..."
+            mkdir -p android/app/src/main/res/mipmap-mdpi
+            mkdir -p android/app/src/main/res/mipmap-hdpi
+            mkdir -p android/app/src/main/res/mipmap-xhdpi
+            mkdir -p android/app/src/main/res/mipmap-xxhdpi
+            mkdir -p android/app/src/main/res/mipmap-xxxhdpi
+            which convert || sudo apt-get install -y imagemagick -q
+            convert icon.png -resize 48x48   android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+            convert icon.png -resize 72x72   android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+            convert icon.png -resize 96x96   android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+            convert icon.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+            convert icon.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            for dir in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+              cp android/app/src/main/res/mipmap-\$dir/ic_launcher.png android/app/src/main/res/mipmap-\$dir/ic_launcher_foreground.png 2>/dev/null || true
+              cp android/app/src/main/res/mipmap-\$dir/ic_launcher.png android/app/src/main/res/mipmap-\$dir/ic_launcher_round.png 2>/dev/null || true
+            done
+            echo "Icon injected successfully!"
+          else
+            echo "No icon.png found, using default icon."
+          fi`;
 
   return `name: Build Android APK
 
@@ -2284,15 +2432,16 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -2302,72 +2451,67 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
 
-      - name: Create package.json
-        run: |
-          cat > package.json << 'PKGJSON'
-          {
-            "name": "app",
-            "version": "1.0.0",
-            "description": "",
-            "main": "index.js",
-            "scripts": {},
-            "keywords": [],
-            "author": "",
-            "license": "ISC"
-          }
-          PKGJSON
+      - name: Accept SDK licenses explicitly
+        run: yes | sdkmanager --licenses || true
 
-      - name: Install Capacitor v7
+      - name: Install Capacitor
         run: |
-          npm install --save @capacitor/core@7.0.0 @capacitor/android@7.0.0
-          npm install --save-dev @capacitor/cli@7.0.0
+          npm install --save @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
 
-      - name: Create capacitor.config.json
+      - name: Init Capacitor project
         run: |
-          cat > capacitor.config.json << 'CAPCONF'
-          {
-            "appId": "${safeAppPkg}",
-            "appName": "${safeAppName}",
-            "webDir": "www",
-            "server": {
-              "androidScheme": "https"
-            }
-          }
-          CAPCONF
+          npx cap init "${appName}" "${appPkg}" --web-dir www --no-interactive 2>/dev/null || true
+          # Overwrite capacitor.config.json with our own (already in repo)
+          echo "Capacitor init done"
 
       - name: Add Android platform
-        run: npx cap add android
-
-      - name: Verify android folder exists
         run: |
-          ls android/app/build.gradle || (echo "ERROR: android folder not created!" && exit 1)
-
-      - name: Patch build.gradle
+          npx cap add android || true
+          ls android/
+${zipExtractStep}
+${iconStep}
+      - name: Patch build.gradle versions
         run: |
           GRADLE="android/app/build.gradle"
-          echo "--- Before patch ---"
-          grep -E "versionCode|versionName|minSdk|targetSdk|compileSdk" "$GRADLE" || true
-          sed -i "s/versionCode [0-9]\\+/versionCode ${appVerCode}/g" "$GRADLE"
+          if [ ! -f "$GRADLE" ]; then echo "ERROR: $GRADLE not found!"; ls android/; exit 1; fi
           sed -i "s/versionCode [0-9]*/versionCode ${appVerCode}/g" "$GRADLE"
-          sed -i 's/versionName \\"[^\\"]*\\"/versionName \\"${appVer}\\"/g' "$GRADLE"
-          sed -i "s/minSdk [0-9]\\+/minSdk ${minApi}/g" "$GRADLE"
+          sed -i "s/versionName \\"[^\\"]*\\"/versionName \\"${appVer}\\"/g" "$GRADLE"
           sed -i "s/minSdk [0-9]*/minSdk ${minApi}/g" "$GRADLE"
-          sed -i "s/targetSdk [0-9]\\+/targetSdk ${targetApi}/g" "$GRADLE"
           sed -i "s/targetSdk [0-9]*/targetSdk ${targetApi}/g" "$GRADLE"
-          sed -i "s/compileSdk [0-9]\\+/compileSdk ${targetApi}/g" "$GRADLE"
           sed -i "s/compileSdk [0-9]*/compileSdk ${targetApi}/g" "$GRADLE"
-          echo "--- After patch ---"
-          grep -E "versionCode|versionName|minSdk|targetSdk|compileSdk" "$GRADLE" || true
+          echo "=== build.gradle versions ==="
+          grep -E "versionCode|versionName|minSdk|targetSdk|compileSdk" "$GRADLE"
 ${fontStep}${orientStep}
-      - name: Sync Capacitor
+      - name: Sync Capacitor to Android
         run: npx cap sync android
 
+      - name: Make Gradle executable
+        run: chmod +x android/gradlew
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-\${{ hashFiles('android/**/*.gradle*') }}
+          restore-keys: gradle-
+
       - name: Build ${buildType.toUpperCase()}
+        working-directory: android
+        run: ${gradleCmd}
+
+      - name: Verify APK exists
         run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew ${gradleCmd.replace('./gradlew ','')} --stacktrace
+          if [ ! -f "${artifactPath}" ]; then
+            echo "ERROR: APK/AAB not found at ${artifactPath}"
+            find android/app/build/outputs -type f 2>/dev/null || echo "No outputs found"
+            exit 1
+          fi
+          echo "APK size: \$(du -sh ${artifactPath})"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -2388,17 +2532,20 @@ function generateCapConfig(appName, appPkg, splashDuration, splashBg, splashAcce
     server: {
       androidScheme: "https"
     },
+    android: {
+      backgroundColor: splashBg
+    },
     plugins: {
       SplashScreen: {
-        launchShowDuration: parseInt(splashDuration),
+        launchShowDuration: parseInt(splashDuration) || 2000,
         launchAutoHide: true,
         backgroundColor: splashBg,
         androidScaleType: "CENTER_CROP",
-        showSpinner: true,
-        androidSpinnerStyle: "large",
-        spinnerColor: splashAccent,
+        showSpinner: false,
         splashFullScreen: true,
-        splashImmersive: true
+        splashImmersive: true,
+        layoutName: "launch_screen",
+        useDialog: false
       }
     }
   }, null, 2);
